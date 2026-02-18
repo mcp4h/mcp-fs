@@ -1,0 +1,57 @@
+.syntect {
+	color: #1f1f1b;
+}
+
+.comment, .comment.block, .comment.line {
+	color: var(--mcp-syntax-comment, #4b4a44);
+	font-style: italic;
+}
+
+.keyword, .storage, .storage.type, .storage.modifier {
+	color: var(--mcp-syntax-keyword, #3b5ccc);
+	font-weight: 600;
+}
+
+.keyword.operator, .operator {
+	color: var(--mcp-syntax-operator, #3b5ccc);
+}
+
+.constant, .constant.character, .constant.language, .constant.other {
+	color: var(--mcp-syntax-constant, #2f7f6b);
+}
+
+.number, .constant.numeric {
+	color: var(--mcp-syntax-number, #2f7f6b);
+}
+
+.string, .string.quoted, .string.regexp, .string.other, .string.template, .string.interpolated {
+	color: var(--mcp-syntax-string, #2f7f6b);
+}
+
+.entity,
+		.entity.name,
+		.entity.name.function,
+		.entity.name.type,
+		.entity.other,
+		.support,
+		.support.function,
+		.support.type {
+	color: var(--mcp-syntax-entity, #1f1f1b);
+}
+
+.variable, .variable.parameter, .variable.other {
+	color: var(--mcp-syntax-variable, #1f1f1b);
+}
+
+.punctuation, .meta, .meta.tag, .meta.brace, .meta.delimiter, .meta.separator, .meta.attribute {
+	color: var(--mcp-syntax-punctuation, #4b4a44);
+}
+
+.entity.name.tag, .entity.name.tag.html, .entity.name.tag.xml, .tag, .meta.tag {
+	color: var(--mcp-syntax-tag, #4b4a44);
+}
+
+.invalid, .invalid.illegal {
+	color: var(--mcp-color-danger, #b3343a);
+	font-weight: 600;
+}

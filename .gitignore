@@ -1,0 +1,9 @@
+/target/
+/tmp/
+*.rs.bk
+*.swp
+*.swo
+.DS_Store
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/

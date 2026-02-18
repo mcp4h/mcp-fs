@@ -1,0 +1,86 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8"/>
+		<title>edit_file review</title>
+		<style>__CSS__</style>
+		<link rel="stylesheet" href="ui://static/syntect.css"/>
+	</head>
+	<body data-view="unified">
+		<header class="diff-header">
+			<h1>edit_file review</h1>
+			<div class="mcp-toolbar">
+				<button class="toggle mcp-button" data-view="unified">Unified</button>
+				<button class="toggle mcp-button" data-view="split">Split</button>
+			</div>
+		</header>
+		<section class="meta">
+			<div>
+				<strong>Path:</strong>
+				__PATH__
+			</div>
+			<div>
+				<strong>Resource:</strong>
+				__RESOURCE__
+			</div>
+		</section>
+		<section class="view view-unified">
+			<table class="diff unified">
+				<thead>
+					<tr>
+						<th class="ln">Original</th>
+						<th class="ln">Updated</th>
+						<th>Unified</th>
+					</tr>
+				</thead>
+				<tbody>__UNIFIED__</tbody>
+			</table>
+		</section>
+		<section class="view view-split">
+			<table class="diff split">
+				<thead>
+					<tr>
+						<th colspan="2">Original</th>
+						<th colspan="2">Updated</th>
+					</tr>
+				</thead>
+				<tbody>__SPLIT__</tbody>
+			</table>
+		</section>
+		<script>
+			(function () {
+				function setView(view) {
+					document.body.setAttribute("data-view", view);
+					var buttons = document.querySelectorAll("button.toggle");
+					buttons.forEach(
+						function (btn) {
+							btn.classList.toggle("active", btn.getAttribute("data-view") === view);
+						}
+					);
+					try {
+						localStorage.setItem("mcp.diff.view", view);
+					}
+					catch (e) {}
+				}
+				var stored = null;
+				try {
+					stored = localStorage.getItem("mcp.diff.view");
+				}
+				catch (e) {}
+				var initial = stored || "unified";
+				setView(initial);
+				document.querySelectorAll("button.toggle")
+					.forEach(
+						function (btn) {
+							btn.addEventListener(
+								"click",
+								function () {
+									setView(btn.getAttribute("data-view"));
+								}
+							);
+						}
+					);
+			})();
+		</script>
+	</body>
+</html>
