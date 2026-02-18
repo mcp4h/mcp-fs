@@ -70,7 +70,6 @@ Use `tools/list` to get full input/output schemas.
 
 Notes:
 
-- Tool execution should use `tools/call` (direct method calls are not supported).
 - Preview mode for `edit_file` is enabled via `_meta.preview` inside `tools/call` params.
 - Tools accept `_meta.granted_scopes` to allow per-call access to additional roots (string or array).
 
