@@ -802,40 +802,6 @@ fn matches_type(entry: &ignore::DirEntry, file_type: Option<&str>) -> Result<boo
 	}
 }
 
-pub fn resolve_path(
-	root: &Path,
-	root_canon: &Path,
-	rel: &str,
-	allow_escape: bool,
-	allowed_roots: &[PathBuf]) -> Result<PathBuf> {
-	let rel_path = Path::new(rel);
-	let candidate = if rel_path.is_absolute() {
-		rel_path.to_path_buf()
-	}
-	else {
-		root.join(rel_path)
-	};
-	let normalized = normalize_path(&candidate);
-	if allow_escape {
-		return Ok(normalized);
-	}
-	let checked = if normalized.exists() {
-		normalized.canonicalize().unwrap_or(normalized.clone())
-	}
-	else {
-		normalized.clone()
-	};
-	if checked.starts_with(root_canon) {
-		return Ok(checked);
-	}
-	for allowed in allowed_roots {
-		if checked.starts_with(allowed) {
-			return Ok(checked);
-		}
-	}
-	Err(anyhow!("path outside root"))
-}
-
 pub fn normalize_relative(rel: &str) -> String {
 	let path = Path::new(rel);
 	let normalized = normalize_path(path);

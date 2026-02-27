@@ -1,6 +1,7 @@
 use crate::fs;
 use crate::protocol::{Request, Response};
 use anyhow::{anyhow, Result};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
@@ -15,7 +16,7 @@ use std::sync::Mutex;
 use syntect::html::{line_tokens_to_classed_spans, ClassStyle};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::{info_span, Span};
+use tracing::{info_span, warn, Span};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -132,16 +133,58 @@ static PREVIEW_CACHE: Lazy<Mutex<PreviewCache>> = Lazy::new(|| Mutex::new(Previe
 
 static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
 
+#[derive(Clone, Debug)]
+pub struct RootConfig {
+	pub path: PathBuf,
+	pub path_canon: PathBuf,
+	pub display: String,
+	pub default: bool,
+	pub immutable: Vec<String>,
+	pub deny: Vec<String>,
+	pub allow: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CallRoot {
+	path: PathBuf,
+	path_canon: PathBuf,
+	display: String,
+	default: bool,
+	blocked: bool,
+	policy_immutable: Vec<String>,
+	deny: Vec<String>,
+	policy_allow: Vec<String>,
+	immutable_set: Option<GlobSet>,
+	policy_immutable_set: Option<GlobSet>,
+	deny_set: Option<GlobSet>,
+	allow_set: Option<GlobSet>,
+	policy_allow_set: Option<GlobSet>,
+}
+
+#[derive(Clone, Debug)]
+struct CallConfig {
+	roots: Vec<CallRoot>,
+	default_root: PathBuf,
+	allow_escape: bool,
+	policy_active: bool,
+	find_limit: Option<usize>,
+	search_max_bytes: Option<usize>,
+	search_summary_top: Option<usize>,
+	read_max_bytes: Option<usize>,
+	read_max_line_bytes: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
-	pub root: PathBuf,
-	pub root_canon: PathBuf,
+	pub roots: Vec<RootConfig>,
+	pub default_root: PathBuf,
+	pub default_root_canon: PathBuf,
 	pub allow_escape: bool,
 	pub find_limit: Option<usize>,
 	pub search_max_bytes: Option<usize>,
 	pub search_summary_top: Option<usize>,
 	pub read_max_bytes: Option<usize>,
 	pub read_max_line_bytes: Option<usize>,
-	pub allowed_roots: Vec<PathBuf>,
 	pub preview_cache_size: Option<usize>,
 	pub otel_enabled: bool,
 	pub otel_endpoint: String,
@@ -149,8 +192,18 @@ pub struct Config {
 	pub session_id: String,
 }
 
+#[derive(Clone, Debug)]
+struct RootInput {
+	path: String,
+	default: Option<bool>,
+	immutable: Vec<String>,
+	deny: Vec<String>,
+	allow: Vec<String>,
+	blocked: Option<bool>,
+}
+
 pub fn load_config() -> Result<Config> {
-	let mut root: Option<PathBuf> = None;
+	let mut root: Option<String> = None;
 	let mut allow_escape = false;
 	let mut find_limit: Option<usize> = Some(200);
 	let mut search_max_bytes: Option<usize> = Some(50 * 1024);
@@ -162,15 +215,24 @@ pub fn load_config() -> Result<Config> {
 	let mut otel_enabled = true;
 	let mut otel_endpoint = String::from("http://127.0.0.1:4317");
 	let mut otel_service_name = String::from("mcp-fs");
+	let mut config_path: Option<String> = None;
+	let mut print_schema = false;
 	let mut args = std::env::args().skip(1);
 	while let Some(arg) = args.next() {
 		match arg.as_str() {
 			"--root" => {
 				let value = args.next().ok_or_else(|| anyhow!("--root requires a value"))?;
-				root = Some(PathBuf::from(value));
+				root = Some(value);
 			}
 			"--allow-escape" => {
 				allow_escape = true;
+			}
+			"--config" => {
+				let value = args.next().ok_or_else(|| anyhow!("--config requires a value"))?;
+				config_path = Some(value);
+			}
+			"--print-config-schema" => {
+				print_schema = true;
 			}
 			"--find-limit" => {
 				let value = args.next().ok_or_else(|| anyhow!("--find-limit requires a value"))?;
@@ -220,7 +282,14 @@ pub fn load_config() -> Result<Config> {
 	if root.is_none() {
 		if let Ok(env_root) = std::env::var("MCP_ROOT") {
 			if !env_root.trim().is_empty() {
-				root = Some(PathBuf::from(env_root));
+				root = Some(env_root);
+			}
+		}
+	}
+	if config_path.is_none() {
+		if let Ok(env_config) = std::env::var("MCP_CONFIG") {
+			if !env_config.trim().is_empty() {
+				config_path = Some(env_config);
 			}
 		}
 	}
@@ -283,27 +352,58 @@ pub fn load_config() -> Result<Config> {
 			otel_service_name = env_service;
 		}
 	}
-	let root = root.unwrap_or(std::env::current_dir()?);
-	let root_canon = root.canonicalize()?;
-	let allowed_roots = normalize_allowed_roots(&root, &allowed_roots_raw);
-	Ok(
-		Config {
-			root: root_canon.clone(),
-			root_canon,
-			allow_escape,
-			find_limit,
-			search_max_bytes,
-			search_summary_top,
-			read_max_bytes,
-			read_max_line_bytes,
-			allowed_roots,
-			preview_cache_size,
-			otel_enabled,
-			otel_endpoint,
-			otel_service_name,
-			session_id: uuid::Uuid::new_v4().to_string()
+	if print_schema {
+		let schema = config_schema();
+		let payload = serde_json::to_string_pretty(&schema)?;
+		println!("{}", payload);
+		std::process::exit(0);
+	}
+	let cwd = std::env::current_dir()?;
+	let root = root.unwrap_or_else(|| cwd.to_string_lossy().to_string());
+	let mut roots_input = Vec::new();
+	roots_input.push(RootInput {
+		path: root,
+		default: Some(true),
+		immutable: Vec::new(),
+		deny: Vec::new(),
+		allow: Vec::new(),
+		blocked: None,
+	});
+	for value in allowed_roots_raw {
+		if !value.trim().is_empty() {
+			roots_input.push(RootInput {
+				path: value,
+				default: Some(false),
+				immutable: Vec::new(),
+				deny: Vec::new(),
+				allow: Vec::new(),
+				blocked: None,
+			});
 		}
-	)
+	}
+	let roots = build_root_configs(&roots_input, &cwd, false)?;
+	let (roots, default_root, default_root_canon) = finalize_roots(roots)?;
+	let base = Config {
+		roots,
+		default_root,
+		default_root_canon,
+		allow_escape,
+		find_limit,
+		search_max_bytes,
+		search_summary_top,
+		read_max_bytes,
+		read_max_line_bytes,
+		preview_cache_size,
+		otel_enabled,
+		otel_endpoint,
+		otel_service_name,
+		session_id: uuid::Uuid::new_v4().to_string(),
+	};
+	if let Some(path) = config_path {
+		let override_value = load_config_value(&path)?;
+		return apply_config_override(base, &override_value, &cwd);
+	}
+	Ok(base)
 }
 
 pub fn init_preview_cache(config: &Config) {
@@ -318,7 +418,7 @@ pub fn init_tracing(config: &Config) {
 		opentelemetry::KeyValue::new(semconv::SERVICE_NAME, config.otel_service_name.clone()),
 		opentelemetry::KeyValue::new(semconv::SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
 		opentelemetry::KeyValue::new("mcp.session_id", config.session_id.clone()),
-		opentelemetry::KeyValue::new("mcp.root", config.root.display().to_string()),
+		opentelemetry::KeyValue::new("mcp.root", config.default_root.display().to_string()),
 		]
 	);
 	let tracing_layer = if config.otel_enabled {
@@ -356,6 +456,7 @@ pub async fn run(config: Config) -> Result<()> {
 	let stdout = io::stdout();
 	let mut reader = BufReader::new(stdin).lines();
 	let mut writer = io::BufWriter::new(stdout);
+	let mut config = config;
 	while let Some(line) = reader.next_line().await? {
 		if line.trim().is_empty() {
 			continue;
@@ -368,9 +469,36 @@ pub async fn run(config: Config) -> Result<()> {
 				continue;
 			}
 		};
+		if req.method == "initialize" {
+			if let Err(err) = apply_initialize_config(&mut config, &req) {
+				let resp = if let Some(protocol) = err.downcast_ref::<ProtocolError>() {
+					Response::err(req.id.clone(), protocol.code, protocol.message.clone())
+				}
+				else {
+					Response::err(req.id.clone(), -32000, err.to_string())
+				};
+				write_response(&mut writer, resp).await?;
+				continue;
+			}
+			init_preview_cache(&config);
+		}
 		let resp = handle_request(&config, req).await;
 		write_response(&mut writer, resp).await?;
 	}
+	Ok(())
+}
+
+fn apply_initialize_config(config: &mut Config, req: &Request) -> Result<()> {
+	let Some(value) = req.params
+		.get("capabilities")
+		.and_then(|caps| caps.get("experimental"))
+		.and_then(|exp| exp.get("configuration")) else {
+		return Ok(());
+	};
+	let cwd = std::env::current_dir()?;
+	let updated = apply_config_override(config.clone(), value, &cwd)
+		.map_err(|err| ProtocolError::new(-32602, err.to_string()))?;
+	*config = updated;
 	Ok(())
 }
 
@@ -398,7 +526,7 @@ async fn handle_request(config: &Config, req: Request) -> Response {
 		"mcp.session_id" = %config.session_id,
 		"mcp.method" = %method,
 		"mcp.tool_name" = tool_name.as_deref().unwrap_or(""),
-		"mcp.root" = %config.root.display(),
+		"mcp.root" = %config.default_root.display(),
 		"mcp.request_root" = request_root.as_deref().unwrap_or(""),
 		"mcp.is_error" = tracing::field::Empty,
 		"mcp.error_code" = tracing::field::Empty,
@@ -438,6 +566,7 @@ async fn route(config: &Config, req: &Request) -> Result<ToolOutcome> {
                 "name": "mcp-fs",
                 "version": "0.1.0"
             },
+					"configSchema": config_schema(),
 					"capabilities": {
                 "resources": {
                     "read": true,
@@ -496,7 +625,7 @@ async fn route(config: &Config, req: &Request) -> Result<ToolOutcome> {
 
 async fn run_tool<F, Fut>(
 	name: &str,
-	config: &Config,
+	config: &CallConfig,
 	preview: Option<bool>,
 	handler: F) -> ToolOutcome
 where
@@ -661,7 +790,7 @@ fn resources_read(req: &Request) -> Result<Value> {
 fn tool_success(
 	name: &str,
 	structured: Value,
-	config: &Config,
+	config: &CallConfig,
 	preview: Option<bool>) -> Value {
 	let message = tool_message(
 		name,
@@ -742,10 +871,10 @@ fn tool_error(_name: &str, err: &anyhow::Error) -> Value {
 }
 
 async fn edit_file_tool(
-	config: &Config,
+	config: &CallConfig,
 	args: &Value,
 	preview: bool,
-	allowed_roots: &[PathBuf]) -> Result<Value> {
+	default_root: &PathBuf) -> Result<Value> {
 	let path = args.get("path")
 		.and_then(Value::as_str)
 		.ok_or_else(|| anyhow!("path is required"))?;
@@ -770,17 +899,11 @@ async fn edit_file_tool(
 				Ok((find.to_string(), replace.to_string()))
 			})
 		.collect::<Result<Vec<_>>>()?;
-	let resolved = fs::resolve_path(
-		&config.root,
-		&config.root_canon,
-		path,
-		config.allow_escape,
-		allowed_roots
-	)
+	let resolved = resolve_path_for_call(config, path)
 		.map_err(
 			|err| {
-				if err.to_string().contains("path outside root") && !config.allow_escape {
-					let scope = requested_scope_for_path("write", path, config);
+				if err.to_string().contains("path outside root") && !config.allow_escape && !config.policy_active {
+					let scope = requested_scope_for_path("write", path, default_root);
 					return RequestedScopeError {
 						scopes: vec![scope]
 					}.into();
@@ -788,8 +911,12 @@ async fn edit_file_tool(
 				anyhow!("invalid path {}: {}", path, err)
 			}
 		)?;
-	let rel_path = relative_to_root(&config.root, &resolved);
-	let existing = tokio::fs::read_to_string(&resolved).await.map_err(|err| format_io_error("read", &rel_path, err.into()))?;
+	ensure_writable_root(config, &resolved)?;
+	let rel_path = match resolved.root_index {
+		Some(index) => relative_to_root(&config.roots[index].path, &resolved.absolute),
+		None => resolved.absolute.to_string_lossy().to_string(),
+	};
+	let existing = tokio::fs::read_to_string(&resolved.absolute).await.map_err(|err| format_io_error("read", &rel_path, err.into()))?;
 	let mut updated = existing.clone();
 	let mut total_matches = 0usize;
 	for (index, (find, replace)) in edits.iter().enumerate() {
@@ -829,7 +956,7 @@ async fn edit_file_tool(
 	let mut cache = PREVIEW_CACHE.lock().expect("preview cache lock");
 	cache.insert(entry);
 	if !preview {
-		tokio::fs::write(&resolved, updated).await.map_err(|err| format_io_error("write", &rel_path, err.into()))?;
+		tokio::fs::write(&resolved.absolute, updated).await.map_err(|err| format_io_error("write", &rel_path, err.into()))?;
 	}
 	Ok(structured)
 }
@@ -837,7 +964,7 @@ async fn edit_file_tool(
 fn tool_message(
 	name: &str,
 	structured: &Value,
-	config: &Config,
+	config: &CallConfig,
 	preview: Option<bool>) -> String {
 	match name {
 		"list_roots" => {
@@ -1007,43 +1134,448 @@ fn merge_meta(preview: bool, extra: Option<Value>) -> Option<Value> {
 	}
 }
 
-fn normalize_allowed_roots(root: &PathBuf, raw: &[String]) -> Vec<PathBuf> {
-	raw.iter()
-		.filter_map(
-			|value| {
-				let trimmed = value.trim();
-				if trimmed.is_empty() {
-					return None;
+fn config_schema() -> Value {
+	json!({
+		"$schema": "http://json-schema.org/draft-07/schema#",
+		"title": "mcp-fs configuration",
+		"type": "object",
+		"additionalProperties": false,
+		"properties": {
+			"roots": {
+				"type": "array",
+				"minItems": 1,
+				"description": "Allowed roots. The default root is used for relative paths.",
+				"items": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"path": { "type": "string", "description": "Absolute or root-relative path." },
+						"default": { "type": "boolean", "description": "Exactly one root should be default." },
+						"immutable": {
+							"type": "array",
+							"items": { "type": "string" },
+							"description": "Glob patterns that disallow write/edit/move/delete. If empty or missing, everything is mutable."
+						},
+						"deny": {
+							"type": "array",
+							"items": { "type": "string" },
+							"description": "Glob patterns to exclude from all operations."
+						},
+						"allow": {
+							"type": "array",
+							"items": { "type": "string" },
+							"description": "Glob patterns to include; anything not matching is denied."
+						},
+						"blocked": {
+							"type": "boolean",
+							"description": "Block this root when used in _meta.policy.",
+							"scope": "policy"
+						}
+					},
+					"required": ["path"]
 				}
-				let path = PathBuf::from(trimmed);
-				let absolute = if path.is_absolute() {
-					path
-				}
-				else {
-					root.join(path)
-				};
-				let normalized = fs::normalize_path(&absolute);
-				let canonical = if normalized.exists() {
-					normalized.canonicalize().unwrap_or(normalized.clone())
-				}
-				else {
-					normalized
-				};
-				Some(canonical)
-			})
-		.collect()
+			},
+			"allow_escape": {
+				"type": "boolean",
+				"description": "Allow paths outside configured roots.",
+				"scope": "configuration"
+			},
+			"find_limit": {
+				"type": "integer",
+				"minimum": 0,
+				"description": "Default limit for find_files.",
+				"audience": "human"
+			},
+			"search_max_bytes": {
+				"type": "integer",
+				"minimum": 0,
+				"description": "Max output bytes for search_files.",
+				"audience": "human"
+			},
+			"search_summary_top": {
+				"type": "integer",
+				"minimum": 0,
+				"description": "Top N files for summary.",
+				"audience": "human"
+			},
+			"read_max_bytes": {
+				"type": "integer",
+				"minimum": 0,
+				"description": "Max output bytes for read_file.",
+				"audience": "human"
+			},
+			"read_max_line_bytes": {
+				"type": "integer",
+				"minimum": 0,
+				"description": "Max bytes per line.",
+				"audience": "human"
+			},
+			"preview_cache_size": {
+				"type": "integer",
+				"minimum": 0,
+				"description": "Preview cache size.",
+				"scope": "configuration"
+			},
+			"otel_enabled": {
+				"type": "boolean",
+				"description": "Enable tracing.",
+				"scope": "configuration"
+			},
+			"otel_endpoint": {
+				"type": "string",
+				"description": "OTLP endpoint.",
+				"scope": "configuration"
+			},
+			"otel_service_name": {
+				"type": "string",
+				"description": "OTEL service.name.",
+				"scope": "configuration"
+			}
+		},
+		"required": ["roots"]
+	})
 }
 
-fn allowed_roots_for_call(config: &Config, granted: &[PathBuf]) -> Vec<PathBuf> {
-	if config.allow_escape {
-		return Vec::new();
+fn load_config_value(path: &str) -> Result<Value> {
+	let content = std::fs::read_to_string(path)
+		.map_err(|err| anyhow!("failed to read config {}: {}", path, err))?;
+	let value: Value = serde_json::from_str(&content)
+		.map_err(|err| anyhow!("failed to parse config {}: {}", path, err))?;
+	Ok(value)
+}
+
+fn apply_config_override(base: Config, value: &Value, cwd: &PathBuf) -> Result<Config> {
+	let obj = value.as_object().ok_or_else(|| anyhow!("config must be an object"))?;
+	let mut next = base.clone();
+	for (key, value) in obj {
+		match key.as_str() {
+			"roots" => {
+				let inputs = parse_root_inputs(value, false)?;
+				let roots = build_root_configs(&inputs, cwd, false)?;
+				let (roots, default_root, default_root_canon) = finalize_roots(roots)?;
+				next.roots = roots;
+				next.default_root = default_root;
+				next.default_root_canon = default_root_canon;
+			}
+			"allow_escape" => {
+				if !value.is_null() {
+					next.allow_escape = value.as_bool().ok_or_else(|| anyhow!("allow_escape must be a boolean"))?;
+				}
+			}
+			"find_limit" => {
+				next.find_limit = parse_optional_usize_value(value, "find_limit")?;
+			}
+			"search_max_bytes" => {
+				next.search_max_bytes = parse_optional_usize_value(value, "search_max_bytes")?;
+			}
+			"search_summary_top" => {
+				next.search_summary_top = parse_optional_usize_value(value, "search_summary_top")?;
+			}
+			"read_max_bytes" => {
+				next.read_max_bytes = parse_optional_usize_value(value, "read_max_bytes")?;
+			}
+			"read_max_line_bytes" => {
+				next.read_max_line_bytes = parse_optional_usize_value(value, "read_max_line_bytes")?;
+			}
+			"preview_cache_size" => {
+				next.preview_cache_size = parse_optional_usize_value(value, "preview_cache_size")?;
+			}
+			"otel_enabled" => {
+				if !value.is_null() {
+					next.otel_enabled = value.as_bool().ok_or_else(|| anyhow!("otel_enabled must be a boolean"))?;
+				}
+			}
+			"otel_endpoint" => {
+				if !value.is_null() {
+					next.otel_endpoint = value.as_str().ok_or_else(|| anyhow!("otel_endpoint must be a string"))?.to_string();
+				}
+			}
+			"otel_service_name" => {
+				if !value.is_null() {
+					next.otel_service_name = value.as_str().ok_or_else(|| anyhow!("otel_service_name must be a string"))?.to_string();
+				}
+			}
+			_ => return Err(anyhow!("unknown config key: {}", key)),
+		}
 	}
+	Ok(next)
+}
+
+fn parse_optional_usize_value(value: &Value, label: &str) -> Result<Option<usize>> {
+	if value.is_null() {
+		return Ok(None);
+	}
+	let number = value.as_u64().ok_or_else(|| anyhow!("{} must be a non-negative integer", label))?;
+	if number == 0 {
+		return Ok(None);
+	}
+	Ok(Some(number as usize))
+}
+
+fn parse_root_inputs(value: &Value, allow_blocked: bool) -> Result<Vec<RootInput>> {
+	let items = value.as_array().ok_or_else(|| anyhow!("roots must be an array"))?;
 	let mut roots = Vec::new();
-	roots.extend(config.allowed_roots
-		.iter()
-		.cloned());
-	roots.extend(granted.iter().cloned());
-	roots
+	for item in items {
+		let obj = item.as_object().ok_or_else(|| anyhow!("root entries must be objects"))?;
+		let mut path: Option<String> = None;
+		let mut default: Option<bool> = None;
+		let mut immutable: Vec<String> = Vec::new();
+		let mut deny: Vec<String> = Vec::new();
+		let mut allow: Vec<String> = Vec::new();
+		let mut blocked: Option<bool> = None;
+		for (key, value) in obj {
+			match key.as_str() {
+				"path" => {
+					path = Some(value.as_str().ok_or_else(|| anyhow!("root.path must be a string"))?.to_string());
+				}
+				"default" => {
+					default = Some(value.as_bool().ok_or_else(|| anyhow!("root.default must be a boolean"))?);
+				}
+				"immutable" => {
+					immutable = parse_string_list(value, "root.immutable")?;
+				}
+				"deny" => {
+					deny = parse_string_list(value, "root.deny")?;
+				}
+				"allow" => {
+					allow = parse_string_list(value, "root.allow")?;
+				}
+				"blocked" => {
+					if allow_blocked {
+						blocked = Some(value.as_bool().ok_or_else(|| anyhow!("root.blocked must be a boolean"))?);
+					}
+				}
+				_ => return Err(anyhow!("unknown root field: {}", key)),
+			}
+		}
+		let path = path.ok_or_else(|| anyhow!("root.path is required"))?;
+		roots.push(RootInput {
+			path,
+			default,
+			immutable,
+			deny,
+			allow,
+			blocked,
+		});
+	}
+	Ok(roots)
+}
+
+fn parse_string_list(value: &Value, label: &str) -> Result<Vec<String>> {
+	let list = value.as_array().ok_or_else(|| anyhow!("{} must be an array", label))?;
+	Ok(list.iter()
+		.filter_map(|item| item.as_str().map(|value| value.to_string()))
+		.collect())
+}
+
+fn build_root_configs(inputs: &[RootInput], cwd: &PathBuf, allow_blocked: bool) -> Result<Vec<RootConfig>> {
+	let mut roots = Vec::new();
+	for input in inputs {
+		if input.blocked.is_some() && !allow_blocked {
+			return Err(anyhow!("root.blocked is only allowed in policy"));
+		}
+		let mut path = PathBuf::from(&input.path);
+		if !path.is_absolute() {
+			path = cwd.join(path);
+		}
+		let normalized = fs::normalize_path(&path);
+		let canonical = if normalized.exists() {
+			normalized.canonicalize().unwrap_or(normalized.clone())
+		}
+		else {
+			normalized.clone()
+		};
+		let display = normalized.to_string_lossy().to_string();
+		roots.push(RootConfig {
+			path: normalized,
+			path_canon: canonical,
+			display,
+			default: input.default.unwrap_or(false),
+			immutable: input.immutable.clone(),
+			deny: input.deny.clone(),
+			allow: input.allow.clone(),
+		});
+	}
+	Ok(roots)
+}
+
+fn finalize_roots(mut roots: Vec<RootConfig>) -> Result<(Vec<RootConfig>, PathBuf, PathBuf)> {
+	if roots.is_empty() {
+		return Err(anyhow!("roots must not be empty"));
+	}
+	let default_count = roots.iter().filter(|root| root.default).count();
+	if default_count == 0 {
+		if let Some(first) = roots.first_mut() {
+			first.default = true;
+		}
+	}
+	else if default_count > 1 {
+		let mut saw_default = false;
+		for root in &mut roots {
+			if root.default {
+				if !saw_default {
+					saw_default = true;
+				}
+				else {
+					root.default = false;
+				}
+			}
+		}
+		warn!("multiple default roots configured; using the first and clearing the rest");
+	}
+	let default_root = roots.iter()
+		.find(|root| root.default)
+		.map(|root| root.path.clone())
+		.ok_or_else(|| anyhow!("default root missing"))?;
+	let default_root_canon = roots.iter()
+		.find(|root| root.default)
+		.map(|root| root.path_canon.clone())
+		.ok_or_else(|| anyhow!("default root missing"))?;
+	Ok((roots, default_root, default_root_canon))
+}
+
+fn build_glob_set(patterns: &[String]) -> Result<Option<GlobSet>> {
+	if patterns.is_empty() {
+		return Ok(None);
+	}
+	let mut builder = GlobSetBuilder::new();
+	for pattern in patterns {
+		let glob = GlobBuilder::new(pattern)
+			.literal_separator(true)
+			.build()
+			.map_err(|err| anyhow!("invalid glob {}: {}", pattern, err))?;
+		builder.add(glob);
+	}
+	Ok(Some(builder.build().map_err(|err| anyhow!("invalid glob set: {}", err))?))
+}
+
+fn resolve_call_config(config: &Config, meta: &Value, tool: &str) -> Result<CallConfig> {
+	let policy = meta.get("policy");
+	let mut roots = Vec::new();
+	for root in &config.roots {
+		roots.push(build_call_root(root)?);
+	}
+	if let Some(policy_value) = policy {
+		apply_policy_to_roots(&mut roots, policy_value, config)?;
+		return Ok(CallConfig {
+			roots: roots.into_iter().filter(|root| !root.blocked).collect(),
+			default_root: config.default_root.clone(),
+			allow_escape: false,
+			policy_active: true,
+			find_limit: config.find_limit,
+			search_max_bytes: config.search_max_bytes,
+			search_summary_top: config.search_summary_top,
+			read_max_bytes: config.read_max_bytes,
+			read_max_line_bytes: config.read_max_line_bytes,
+		});
+	}
+	let granted_roots = granted_roots_for_tool(config, tool, meta);
+	if !config.allow_escape {
+		for granted in granted_roots {
+		roots.push(CallRoot {
+			path: granted.clone(),
+			path_canon: granted.clone(),
+			display: granted.to_string_lossy().to_string(),
+			default: false,
+			blocked: false,
+			policy_immutable: Vec::new(),
+			deny: Vec::new(),
+			policy_allow: Vec::new(),
+			immutable_set: None,
+			policy_immutable_set: None,
+			deny_set: None,
+			allow_set: None,
+			policy_allow_set: None,
+		});
+	}
+	}
+	Ok(CallConfig {
+		roots,
+		default_root: config.default_root.clone(),
+		allow_escape: config.allow_escape,
+		policy_active: false,
+		find_limit: config.find_limit,
+		search_max_bytes: config.search_max_bytes,
+		search_summary_top: config.search_summary_top,
+		read_max_bytes: config.read_max_bytes,
+		read_max_line_bytes: config.read_max_line_bytes,
+	})
+}
+
+fn build_call_root(root: &RootConfig) -> Result<CallRoot> {
+	Ok(CallRoot {
+		path: root.path.clone(),
+		path_canon: root.path_canon.clone(),
+		display: root.display.clone(),
+		default: root.default,
+		blocked: false,
+		policy_immutable: Vec::new(),
+		deny: root.deny.clone(),
+		policy_allow: Vec::new(),
+		immutable_set: build_glob_set(&root.immutable)?,
+		policy_immutable_set: None,
+		deny_set: build_glob_set(&root.deny)?,
+		allow_set: build_glob_set(&root.allow)?,
+		policy_allow_set: None,
+	})
+}
+
+fn apply_policy_to_roots(roots: &mut [CallRoot], policy: &Value, config: &Config) -> Result<()> {
+	let obj = policy.as_object().ok_or_else(|| ProtocolError::new(-32602, "policy must be an object"))?;
+	let mut policy_roots: Vec<RootInput> = Vec::new();
+	for (key, value) in obj {
+		match key.as_str() {
+			"roots" => {
+				policy_roots = parse_root_inputs(value, true)?;
+			}
+			_ => return Err(ProtocolError::new(-32602, format!("unknown policy key: {}", key)).into()),
+		}
+	}
+	let cwd = std::env::current_dir().unwrap_or_else(|_| config.default_root.clone());
+	for policy_root in policy_roots {
+		if policy_root.default.is_some() {
+			return Err(ProtocolError::new(-32602, "policy roots must not include default").into());
+		}
+		let normalized = normalize_root_path(&policy_root.path, &cwd);
+		let (index, _) = roots.iter().enumerate()
+			.find(|(_, root)| root.path_canon == normalized || root.path == normalized)
+			.ok_or_else(|| ProtocolError::new(-32602, format!("policy root not found: {}", policy_root.path)))?;
+		if let Some(blocked) = policy_root.blocked {
+			if blocked {
+				if roots[index].default {
+					return Err(ProtocolError::new(-32602, "policy cannot block the default root").into());
+				}
+				roots[index].blocked = true;
+			}
+		}
+		if !policy_root.immutable.is_empty() {
+			roots[index].policy_immutable.extend(policy_root.immutable);
+			roots[index].policy_immutable_set = build_glob_set(&roots[index].policy_immutable)?;
+		}
+		if !policy_root.deny.is_empty() {
+			roots[index].deny.extend(policy_root.deny);
+			roots[index].deny_set = build_glob_set(&roots[index].deny)?;
+		}
+		if !policy_root.allow.is_empty() {
+			roots[index].policy_allow.extend(policy_root.allow);
+			roots[index].policy_allow_set = build_glob_set(&roots[index].policy_allow)?;
+		}
+	}
+	Ok(())
+}
+
+fn normalize_root_path(path: &str, cwd: &PathBuf) -> PathBuf {
+	let mut root_path = PathBuf::from(path);
+	if !root_path.is_absolute() {
+		root_path = cwd.join(root_path);
+	}
+	let normalized = fs::normalize_path(&root_path);
+	if normalized.exists() {
+		normalized.canonicalize().unwrap_or(normalized)
+	}
+	else {
+		normalized
+	}
 }
 
 fn tool_verb(tool: &str) -> Option<&'static str> {
@@ -1090,30 +1622,30 @@ fn parse_scope_root(config: &Config, scope: &str, verb: &str) -> Option<PathBuf>
 		path
 	}
 	else {
-		config.root.join(path)
+		config.default_root.join(path)
 	};
 	Some(fs::normalize_path(&absolute))
 }
 
-fn requested_scope_for_root(verb: &str, root_param: &str, config: &Config) -> String {
+fn requested_scope_for_root(verb: &str, root_param: &str, default_root: &PathBuf) -> String {
 	let path = PathBuf::from(root_param);
 	let absolute = if path.is_absolute() {
 		path
 	}
 	else {
-		config.root.join(path)
+		default_root.join(path)
 	};
 	let normalized = fs::normalize_path(&absolute);
 	format!("{}:file:{}", verb, normalized.display())
 }
 
-fn requested_scope_for_path(verb: &str, path_param: &str, config: &Config) -> String {
+fn requested_scope_for_path(verb: &str, path_param: &str, default_root: &PathBuf) -> String {
 	let path = PathBuf::from(path_param);
 	let absolute = if path.is_absolute() {
 		path
 	}
 	else {
-		config.root.join(path)
+		default_root.join(path)
 	};
 	let normalized = fs::normalize_path(&absolute);
 	let scope_root = if path_param.ends_with('/') {
@@ -1127,21 +1659,13 @@ fn requested_scope_for_path(verb: &str, path_param: &str, config: &Config) -> St
 	format!("{}:file:{}", verb, scope_root.display())
 }
 
-fn build_roots_output(config: &Config, granted: &[PathBuf]) -> Vec<Value> {
+fn build_roots_output(config: &CallConfig) -> Vec<Value> {
 	let mut roots = BTreeSet::new();
-	let default_root = config.root
-		.to_string_lossy()
-		.to_string();
-	roots.insert(default_root.clone());
-	for allowed in &config.allowed_roots {
-		roots.insert(allowed.to_string_lossy().to_string());
-	}
-	for granted_root in granted {
-		roots.insert(granted_root.to_string_lossy().to_string());
+	for root in &config.roots {
+		roots.insert((root.display.clone(), root.default));
 	}
 	roots.into_iter()
-		.map(|path| {
-			let default = path == default_root;
+		.map(|(path, default)| {
 			json!({
 				"path": path,
 				"default": default
@@ -1176,6 +1700,212 @@ fn relative_to_root(root: &PathBuf, path: &PathBuf) -> String {
 	else {
 		rel_str
 	}
+}
+
+struct ResolvedPath {
+	absolute: PathBuf,
+	root_index: Option<usize>,
+}
+
+fn resolve_path_for_call(call: &CallConfig, path_param: &str) -> Result<ResolvedPath> {
+	let raw = PathBuf::from(path_param);
+	let candidate = if raw.is_absolute() {
+		raw
+	}
+	else {
+		call.default_root.join(raw)
+	};
+	let normalized = fs::normalize_path(&candidate);
+	let checked = if normalized.exists() {
+		normalized.canonicalize().unwrap_or(normalized.clone())
+	}
+	else {
+		normalized.clone()
+	};
+	let root_index = find_root_for_path(call, &checked);
+	if root_index.is_none() && !call.allow_escape {
+		return Err(anyhow!("path outside root"));
+	}
+	if let Some(index) = root_index {
+		let root = &call.roots[index];
+		let rel = relative_to_root(&root.path, &checked);
+		if !is_path_allowed(root, &rel) {
+			return Err(anyhow!("path blocked by policy"));
+		}
+	}
+	Ok(ResolvedPath {
+		absolute: checked,
+		root_index,
+	})
+}
+
+fn ensure_writable_root(call: &CallConfig, resolved: &ResolvedPath) -> Result<()> {
+	let Some(index) = resolved.root_index else {
+		return Ok(());
+	};
+	let root = &call.roots[index];
+	let rel = relative_to_root(&root.path, &resolved.absolute);
+	if is_path_immutable(root, &rel) {
+		return Err(anyhow!("path is immutable; write operations are not allowed"));
+	}
+	Ok(())
+}
+
+fn is_path_immutable(root: &CallRoot, rel: &str) -> bool {
+	if rel.is_empty() {
+		return false;
+	}
+	if let Some(set) = &root.immutable_set {
+		if set.is_match(rel) {
+			return true;
+		}
+	}
+	if let Some(set) = &root.policy_immutable_set {
+		if set.is_match(rel) {
+			return true;
+		}
+	}
+	false
+}
+
+fn resolve_root_param(call: &CallConfig, root_param: &str) -> Result<(PathBuf, Option<usize>, String, String)> {
+	let raw = PathBuf::from(root_param);
+	let candidate = if raw.is_absolute() {
+		raw
+	}
+	else {
+		call.default_root.join(raw)
+	};
+	let normalized = fs::normalize_path(&candidate);
+	let checked = if normalized.exists() {
+		normalized.canonicalize().unwrap_or(normalized.clone())
+	}
+	else {
+		normalized.clone()
+	};
+	let root_index = find_root_for_path(call, &checked);
+	if root_index.is_none() && !call.allow_escape {
+		return Err(anyhow!("path outside root"));
+	}
+	if let Some(index) = root_index {
+		let root = &call.roots[index];
+		let rel = relative_to_root(&root.path, &checked);
+		if !is_path_allowed(root, &rel) {
+			return Err(anyhow!("root blocked by policy"));
+		}
+		let root_label = if std::path::Path::new(root_param).is_absolute() {
+			root_param.to_string()
+		}
+		else {
+			fs::normalize_relative(root_param)
+		};
+		return Ok((checked, Some(index), root_label, rel));
+	}
+	let root_label = if std::path::Path::new(root_param).is_absolute() {
+		root_param.to_string()
+	}
+	else {
+		fs::normalize_relative(root_param)
+	};
+	Ok((checked, None, root_label, String::new()))
+}
+
+fn find_root_for_path(call: &CallConfig, path: &PathBuf) -> Option<usize> {
+	let mut best: Option<(usize, usize)> = None;
+	for (index, root) in call.roots.iter().enumerate() {
+		if path.starts_with(&root.path_canon) {
+			let depth = root.path_canon.components().count();
+			if best.map(|(_, best_depth)| depth > best_depth).unwrap_or(true) {
+				best = Some((index, depth));
+			}
+		}
+	}
+	best.map(|(index, _)| index)
+}
+
+fn is_path_allowed(root: &CallRoot, rel: &str) -> bool {
+	if rel.is_empty() {
+		return true;
+	}
+	if let Some(set) = &root.deny_set {
+		if set.is_match(rel) {
+			return false;
+		}
+	}
+	if let Some(set) = &root.allow_set {
+		if !set.is_match(rel) {
+			return false;
+		}
+	}
+	if let Some(set) = &root.policy_allow_set {
+		if !set.is_match(rel) {
+			return false;
+		}
+	}
+	true
+}
+
+fn filter_find_results(call: &CallConfig, root_index: Option<usize>, root_prefix: &str, value: Value) -> Result<Value> {
+	let Some(index) = root_index else {
+		return Ok(value);
+	};
+	let root = &call.roots[index];
+	let mut obj = value.as_object().cloned().ok_or_else(|| anyhow!("find result must be object"))?;
+	let matches = obj.get("matches").and_then(Value::as_array).cloned().unwrap_or_default();
+	let mut filtered: Vec<Value> = Vec::new();
+	for item in matches {
+		let Some(text) = item.as_str() else {
+			continue;
+		};
+		let combined = if root_prefix.is_empty() || root_prefix == "." {
+			text.to_string()
+		}
+		else {
+			format!("{}/{}", root_prefix.trim_end_matches('/'), text)
+		};
+		if is_path_allowed(root, &combined) {
+			filtered.push(Value::String(text.to_string()));
+		}
+	}
+	obj.insert("matches".to_string(), Value::Array(filtered.clone()));
+	obj.insert("count".to_string(), Value::Number(filtered.len().into()));
+	Ok(Value::Object(obj))
+}
+
+fn filter_search_results(call: &CallConfig, root_index: Option<usize>, root_prefix: &str, value: Value) -> Result<Value> {
+	let Some(index) = root_index else {
+		return Ok(value);
+	};
+	let root = &call.roots[index];
+	let mut obj = value.as_object().cloned().ok_or_else(|| anyhow!("search result must be object"))?;
+	let files = obj.get("files").and_then(Value::as_array).cloned().unwrap_or_default();
+	let mut filtered_files: Vec<Value> = Vec::new();
+	let mut total_matches = 0usize;
+	for file in files {
+		let Some(path) = file.get("path").and_then(Value::as_str) else {
+			continue;
+		};
+		let combined = if root_prefix.is_empty() || root_prefix == "." {
+			path.to_string()
+		}
+		else {
+			format!("{}/{}", root_prefix.trim_end_matches('/'), path)
+		};
+		if is_path_allowed(root, &combined) {
+			if let Some(matches) = file.get("matches").and_then(Value::as_array) {
+				total_matches += matches.len();
+			}
+			else if let Some(count) = file.get("count").and_then(Value::as_u64) {
+				total_matches += count as usize;
+			}
+			filtered_files.push(file);
+		}
+	}
+	obj.insert("files".to_string(), Value::Array(filtered_files.clone()));
+	obj.insert("count".to_string(), Value::Number(filtered_files.len().into()));
+	obj.insert("total_files".to_string(), Value::Number(filtered_files.len().into()));
+	obj.insert("total_matches".to_string(), Value::Number(total_matches.into()));
+	Ok(Value::Object(obj))
 }
 
 fn error_code(message: &str) -> &'static str {
@@ -1899,16 +2629,14 @@ async fn execute_tool(
 	let params = arguments.as_object().ok_or_else(|| ProtocolError::new(-32602, "arguments must be an object"))?;
 	let args = Value::Object(params.clone());
 	let preview = parse_meta_preview(meta.get("preview"));
-	let granted_roots = granted_roots_for_tool(config, name, meta);
-	let allowed_roots = allowed_roots_for_call(config, &granted_roots);
+	let call_config = resolve_call_config(config, meta, name)?;
 	let result = match name {
 		"list_roots" => run_tool(
 			"list_roots",
-			config,
+			&call_config,
 			None,
 			|| async {
-				let granted = granted_roots_for_tool(config, name, meta);
-				let roots = build_roots_output(config, &granted);
+				let roots = build_roots_output(&call_config);
 				Ok(json!({
 					"roots": roots
 				}))
@@ -1916,7 +2644,7 @@ async fn execute_tool(
 		).await,
 		"search_files" => run_tool(
 			"search_files",
-			config,
+			&call_config,
 			None,
 			|| async {
 				let pattern = args.get("pattern")
@@ -1925,33 +2653,19 @@ async fn execute_tool(
 				let root_param = args.get("root")
 					.and_then(Value::as_str)
 					.unwrap_or(".");
-				let root_path = fs::resolve_path(
-					&config.root,
-					&config.root_canon,
-					root_param,
-					config.allow_escape,
-					&allowed_roots
-				)
-					.map_err(
-						|err| {
-							if err.to_string().contains("path outside root") && !config.allow_escape {
-								let scope = requested_scope_for_root("read", root_param, config);
-								return RequestedScopeError {
-									scopes: vec![scope]
-								}.into();
-							}
-							err
+				let (root_path, root_index, root_label, root_rel) = resolve_root_param(&call_config, root_param)
+					.map_err(|err| {
+						if err.to_string().contains("path outside root") && !call_config.allow_escape && !call_config.policy_active {
+							let scope = requested_scope_for_root("read", root_param, &config.default_root);
+							return RequestedScopeError {
+								scopes: vec![scope]
+							}.into();
 						}
-					)?;
+						err
+					})?;
 				if !root_path.exists() {
 					return Err(anyhow!("root not found: {}", root_param));
 				}
-				let root_label = if std::path::Path::new(root_param).is_absolute() {
-					root_param.to_string()
-				}
-				else {
-					fs::normalize_relative(root_param)
-				};
 				let glob = args.get("glob")
 					.and_then(Value::as_array)
 					.map(
@@ -1978,20 +2692,21 @@ async fn execute_tool(
 					before_context,
 					after_context,
 					context,
-					max_bytes: config.search_max_bytes,
-					summary_top: config.search_summary_top
+					max_bytes: call_config.search_max_bytes,
+					summary_top: call_config.search_summary_top
 				};
-				fs::rg_search(
+				let result = fs::rg_search(
 					&root_path,
 					&root_label,
 					pattern,
 					options
-				).await
+				).await?;
+				filter_search_results(&call_config, root_index, &root_rel, result)
 			}
 		).await,
 		"find_files" => run_tool(
 			"find_files",
-			config,
+			&call_config,
 			None,
 			|| async {
 				let pattern = args.get("pattern")
@@ -2000,24 +2715,16 @@ async fn execute_tool(
 				let root_param = args.get("root")
 					.and_then(Value::as_str)
 					.unwrap_or(".");
-				let root_path = fs::resolve_path(
-					&config.root,
-					&config.root_canon,
-					root_param,
-					config.allow_escape,
-					&allowed_roots
-				)
-					.map_err(
-						|err| {
-							if err.to_string().contains("path outside root") && !config.allow_escape {
-								let scope = requested_scope_for_root("read", root_param, config);
-								return RequestedScopeError {
-									scopes: vec![scope]
-								}.into();
-							}
-							err
+				let (root_path, root_index, root_label, root_rel) = resolve_root_param(&call_config, root_param)
+					.map_err(|err| {
+						if err.to_string().contains("path outside root") && !call_config.allow_escape && !call_config.policy_active {
+							let scope = requested_scope_for_root("read", root_param, &config.default_root);
+							return RequestedScopeError {
+								scopes: vec![scope]
+							}.into();
 						}
-					)?;
+						err
+					})?;
 				if !root_path.exists() {
 					return Err(anyhow!("root not found: {}", root_param));
 				}
@@ -2041,10 +2748,10 @@ async fn execute_tool(
 							values.iter()
 								.filter_map(Value::as_str)
 								.map(|value| value.to_string())
-								.collect::<Vec<_>>()
-						})
-					.unwrap_or_default();
-				let limit = parse_limit(args.get("limit"))?.or(config.find_limit);
+					.collect::<Vec<_>>()
+				})
+				.unwrap_or_default();
+				let limit = parse_limit(args.get("limit"))?.or(call_config.find_limit);
 				let offset = args.get("offset")
 					.and_then(Value::as_u64)
 					.unwrap_or(0) as usize;
@@ -2058,23 +2765,18 @@ async fn execute_tool(
 					limit,
 					offset
 				};
-				let root_label = if std::path::Path::new(root_param).is_absolute() {
-					root_param.to_string()
-				}
-				else {
-					fs::normalize_relative(root_param)
-				};
-				fs::find(
+				let result = fs::find(
 					&root_path,
 					&root_label,
 					pattern,
 					options
-				).await
+				).await?;
+				filter_find_results(&call_config, root_index, &root_rel, result)
 			}
 		).await,
 		"read_file" => run_tool(
 			"read_file",
-			config,
+			&call_config,
 			None,
 			|| async {
 				let path = args.get("path")
@@ -2085,29 +2787,24 @@ async fn execute_tool(
 					.unwrap_or(1) as usize;
 				let limit = parse_read_limit(args.get("limit"))?.unwrap_or(200);
 				let highlight = parse_meta_highlight(meta.get("highlight"));
-				let resolved = fs::resolve_path(
-					&config.root,
-					&config.root_canon,
-					path,
-					config.allow_escape,
-					&allowed_roots
-				)
-					.map_err(
-						|err| {
-							if err.to_string().contains("path outside root") && !config.allow_escape {
-								let scope = requested_scope_for_path("read", path, config);
-								return RequestedScopeError {
-									scopes: vec![scope]
-								}.into();
-							}
-							anyhow!("invalid path {}: {}", path, err)
+				let resolved = resolve_path_for_call(&call_config, path)
+					.map_err(|err| {
+						if err.to_string().contains("path outside root") && !call_config.allow_escape && !call_config.policy_active {
+							let scope = requested_scope_for_path("read", path, &config.default_root);
+							return RequestedScopeError {
+								scopes: vec![scope]
+							}.into();
 						}
-					)?;
-				let rel_path = relative_to_root(&config.root, &resolved);
-				let max_total = config.read_max_bytes.unwrap_or(usize::MAX);
-				let max_line = config.read_max_line_bytes.unwrap_or(usize::MAX);
+						anyhow!("invalid path {}: {}", path, err)
+					})?;
+				let rel_path = match resolved.root_index {
+					Some(index) => relative_to_root(&call_config.roots[index].path, &resolved.absolute),
+					None => resolved.absolute.to_string_lossy().to_string(),
+				};
+				let max_total = call_config.read_max_bytes.unwrap_or(usize::MAX);
+				let max_line = call_config.read_max_line_bytes.unwrap_or(usize::MAX);
 				if highlight {
-					let raw = tokio::fs::read_to_string(&resolved).await.map_err(|err| format_io_error("read", &rel_path, err.into()))?;
+					let raw = tokio::fs::read_to_string(&resolved.absolute).await.map_err(|err| format_io_error("read", &rel_path, err.into()))?;
 					let (lines, count, total, truncated, truncated_reason, long_lines) = fs::format_line_slices(
 						&raw,
 						start_line,
@@ -2157,7 +2854,7 @@ async fn execute_tool(
 				}
 				else {
 					let data = fs::read_file(
-						&resolved,
+						&resolved.absolute,
 						start_line,
 						limit,
 						max_total,
@@ -2180,7 +2877,7 @@ async fn execute_tool(
 		).await,
 		"read_multiple_files" => run_tool(
 			"read_multiple_files",
-			config,
+			&call_config,
 			None,
 			|| async {
 				let paths = args.get("paths").ok_or_else(|| anyhow!("paths is required"))?.as_array()
@@ -2188,8 +2885,8 @@ async fn execute_tool(
 				if paths.is_empty() {
 					return Err(anyhow!("paths is empty"));
 				}
-				let max_total = config.read_max_bytes.unwrap_or(usize::MAX);
-				let max_line = config.read_max_line_bytes.unwrap_or(usize::MAX);
+				let max_total = call_config.read_max_bytes.unwrap_or(usize::MAX);
+				let max_line = call_config.read_max_line_bytes.unwrap_or(usize::MAX);
 				let per_file = if max_total == usize::MAX {
 					usize::MAX
 				}
@@ -2203,19 +2900,13 @@ async fn execute_tool(
 						Some(value) => value,
 						None => continue,
 					};
-					let resolved = match fs::resolve_path(
-						&config.root,
-						&config.root_canon,
-						path,
-						config.allow_escape,
-						&allowed_roots
-					) {
+					let resolved = match resolve_path_for_call(&call_config, path) {
 						Ok(resolved) => resolved,
 						Err(err) => {
-							if err.to_string().contains("path outside root") && !config.allow_escape {
-								requested_scopes.push(requested_scope_for_path("read", path, config));
+							if err.to_string().contains("path outside root") && !call_config.allow_escape && !call_config.policy_active {
+								requested_scopes.push(requested_scope_for_path("read", path, &config.default_root));
 							}
-							let rel_path = relative_to_root(&config.root, &PathBuf::from(path));
+							let rel_path = relative_to_root(&call_config.default_root, &PathBuf::from(path));
 							files.push(json!({
 								"path": rel_path,
 								"code": "INVALID_PATH"
@@ -2223,8 +2914,11 @@ async fn execute_tool(
 							continue;
 						}
 					};
-					let rel_path = relative_to_root(&config.root, &resolved);
-					match fs::read_file_head(&resolved, per_file, max_line).await {
+					let rel_path = match resolved.root_index {
+						Some(index) => relative_to_root(&call_config.roots[index].path, &resolved.absolute),
+						None => resolved.absolute.to_string_lossy().to_string(),
+					};
+					match fs::read_file_head(&resolved.absolute, per_file, max_line).await {
 						Ok((content, count, total, truncated, long_lines)) => {
 							let mut entry = serde_json::Map::new();
 							entry.insert("path".to_string(), Value::String(rel_path));
@@ -2259,7 +2953,7 @@ async fn execute_tool(
 						}
 					}
 				}
-				if !requested_scopes.is_empty() && !config.allow_escape {
+				if !requested_scopes.is_empty() && !call_config.allow_escape && !call_config.policy_active {
 					return Err(RequestedScopeError {
 						scopes: requested_scopes
 					}.into());
@@ -2271,7 +2965,7 @@ async fn execute_tool(
 		).await,
 		"move_file" => run_tool(
 			"move_file",
-			config,
+			&call_config,
 			None,
 			|| async {
 				let from = args.get("from")
@@ -2280,48 +2974,40 @@ async fn execute_tool(
 				let to = args.get("to")
 					.and_then(Value::as_str)
 					.ok_or_else(|| anyhow!("to is required"))?;
-				let resolved_from = fs::resolve_path(
-					&config.root,
-					&config.root_canon,
-					from,
-					config.allow_escape,
-					&allowed_roots
-				)
-					.map_err(
-						|err| {
-							if err.to_string().contains("path outside root") && !config.allow_escape {
-								let scope = requested_scope_for_path("write", from, config);
-								return RequestedScopeError {
-									scopes: vec![scope]
-								}.into();
-							}
-							anyhow!("invalid path {}: {}", from, err)
+				let resolved_from = resolve_path_for_call(&call_config, from)
+					.map_err(|err| {
+						if err.to_string().contains("path outside root") && !call_config.allow_escape && !call_config.policy_active {
+							let scope = requested_scope_for_path("write", from, &config.default_root);
+							return RequestedScopeError {
+								scopes: vec![scope]
+							}.into();
 						}
-					)?;
-				let resolved_to = fs::resolve_path(
-					&config.root,
-					&config.root_canon,
-					to,
-					config.allow_escape,
-					&allowed_roots
-				)
-					.map_err(
-						|err| {
-							if err.to_string().contains("path outside root") && !config.allow_escape {
-								let scope = requested_scope_for_path("write", to, config);
-								return RequestedScopeError {
-									scopes: vec![scope]
-								}.into();
-							}
-							anyhow!("invalid path {}: {}", to, err)
+						anyhow!("invalid path {}: {}", from, err)
+					})?;
+				ensure_writable_root(&call_config, &resolved_from)?;
+				let resolved_to = resolve_path_for_call(&call_config, to)
+					.map_err(|err| {
+						if err.to_string().contains("path outside root") && !call_config.allow_escape && !call_config.policy_active {
+							let scope = requested_scope_for_path("write", to, &config.default_root);
+							return RequestedScopeError {
+								scopes: vec![scope]
+							}.into();
 						}
-					)?;
-				if resolved_from == config.root_canon || resolved_to == config.root_canon {
+						anyhow!("invalid path {}: {}", to, err)
+					})?;
+				ensure_writable_root(&call_config, &resolved_to)?;
+				if call_config.roots.iter().any(|root| resolved_from.absolute == root.path_canon || resolved_to.absolute == root.path_canon) {
 					return Err(anyhow!("cannot move root"));
 				}
-				let rel_from = relative_to_root(&config.root, &resolved_from);
-				let rel_to = relative_to_root(&config.root, &resolved_to);
-				fs::move_path(&resolved_from, &resolved_to).await.map_err(|err| format_io_error("move", &rel_from, err))?;
+				let rel_from = match resolved_from.root_index {
+					Some(index) => relative_to_root(&call_config.roots[index].path, &resolved_from.absolute),
+					None => resolved_from.absolute.to_string_lossy().to_string(),
+				};
+				let rel_to = match resolved_to.root_index {
+					Some(index) => relative_to_root(&call_config.roots[index].path, &resolved_to.absolute),
+					None => resolved_to.absolute.to_string_lossy().to_string(),
+				};
+				fs::move_path(&resolved_from.absolute, &resolved_to.absolute).await.map_err(|err| format_io_error("move", &rel_from, err))?;
 				Ok(json!({
 					"from": rel_from, "to": rel_to
 				}))
@@ -2329,35 +3015,31 @@ async fn execute_tool(
 		).await,
 		"delete_file" => run_tool(
 			"delete_file",
-			config,
+			&call_config,
 			None,
 			|| async {
 				let path = args.get("path")
 					.and_then(Value::as_str)
 					.ok_or_else(|| anyhow!("path is required"))?;
-				let resolved = fs::resolve_path(
-					&config.root,
-					&config.root_canon,
-					path,
-					config.allow_escape,
-					&allowed_roots
-				)
-					.map_err(
-						|err| {
-							if err.to_string().contains("path outside root") && !config.allow_escape {
-								let scope = requested_scope_for_path("write", path, config);
-								return RequestedScopeError {
-									scopes: vec![scope]
-								}.into();
-							}
-							anyhow!("invalid path {}: {}", path, err)
+				let resolved = resolve_path_for_call(&call_config, path)
+					.map_err(|err| {
+						if err.to_string().contains("path outside root") && !call_config.allow_escape && !call_config.policy_active {
+							let scope = requested_scope_for_path("write", path, &config.default_root);
+							return RequestedScopeError {
+								scopes: vec![scope]
+							}.into();
 						}
-					)?;
-				if resolved == config.root_canon {
+						anyhow!("invalid path {}: {}", path, err)
+					})?;
+				ensure_writable_root(&call_config, &resolved)?;
+				if call_config.roots.iter().any(|root| resolved.absolute == root.path_canon) {
 					return Err(anyhow!("cannot delete root"));
 				}
-				let rel_path = relative_to_root(&config.root, &resolved);
-				fs::delete_path(&resolved).await.map_err(|err| format_io_error("delete", &rel_path, err))?;
+				let rel_path = match resolved.root_index {
+					Some(index) => relative_to_root(&call_config.roots[index].path, &resolved.absolute),
+					None => resolved.absolute.to_string_lossy().to_string(),
+				};
+				fs::delete_path(&resolved.absolute).await.map_err(|err| format_io_error("delete", &rel_path, err))?;
 				Ok(json!({
 					"path": rel_path
 				}))
@@ -2365,7 +3047,7 @@ async fn execute_tool(
 		).await,
 		"write_file" => run_tool(
 			"write_file",
-			config,
+			&call_config,
 			Some(preview),
 			|| async {
 				let path = args.get("path")
@@ -2378,27 +3060,23 @@ async fn execute_tool(
 					.and_then(Value::as_str)
 					.unwrap_or("overwrite");
 				let apply = !preview;
-				let resolved = fs::resolve_path(
-					&config.root,
-					&config.root_canon,
-					path,
-					config.allow_escape,
-					&allowed_roots
-				)
-					.map_err(
-						|err| {
-							if err.to_string().contains("path outside root") && !config.allow_escape {
-								let scope = requested_scope_for_path("write", path, config);
-								return RequestedScopeError {
-									scopes: vec![scope]
-								}.into();
-							}
-							anyhow!("invalid path {}: {}", path, err)
+				let resolved = resolve_path_for_call(&call_config, path)
+					.map_err(|err| {
+						if err.to_string().contains("path outside root") && !call_config.allow_escape && !call_config.policy_active {
+							let scope = requested_scope_for_path("write", path, &config.default_root);
+							return RequestedScopeError {
+								scopes: vec![scope]
+							}.into();
 						}
-					)?;
-				let rel_path = relative_to_root(&config.root, &resolved);
+						anyhow!("invalid path {}: {}", path, err)
+					})?;
+				ensure_writable_root(&call_config, &resolved)?;
+				let rel_path = match resolved.root_index {
+					Some(index) => relative_to_root(&call_config.roots[index].path, &resolved.absolute),
+					None => resolved.absolute.to_string_lossy().to_string(),
+				};
 				let data = fs::write_file(
-					&resolved,
+					&resolved.absolute,
 					content,
 					mode,
 					apply
@@ -2444,9 +3122,9 @@ async fn execute_tool(
 		).await,
 		"edit_file" => run_tool(
 			"edit_file",
-			config,
+			&call_config,
 			Some(preview),
-			|| async { edit_file_tool(config, &args, preview, &allowed_roots).await }
+			|| async { edit_file_tool(&call_config, &args, preview, &config.default_root).await }
 		).await,
 		_ => return Err(ProtocolError::new(-32601, "unknown tool").into()),
 	};
