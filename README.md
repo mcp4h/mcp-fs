@@ -65,6 +65,7 @@ Configuration sources are merged in this order (see SEP-1596 for config schema b
 4. Per-call `_meta.policy` restrictions
 
 The configuration schema is available in the initialize response (`configSchema`) and via `--print-config-schema`.
+Initialize capabilities include `capabilities.experimental.policy = true` to indicate policy support.
 
 Custom schema metadata:
 
@@ -122,6 +123,7 @@ Use `tools/list` to get full input/output schemas.
 Notes:
 
 - Preview mode for `edit_file` is enabled via `_meta.preview` inside `tools/call` params.
+- `tools/list` includes `annotations.preview: true` for tools that support preview.
 - Tools accept `_meta.granted_scopes` to allow per-call access to additional roots (string or array).
 
 ### Runtime Policy

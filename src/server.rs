@@ -567,7 +567,7 @@ async fn route(config: &Config, req: &Request) -> Result<ToolOutcome> {
                 "version": "0.1.0"
             },
 					"configSchema": config_schema(),
-					"capabilities": {
+				"capabilities": {
                 "resources": {
                     "read": true,
                     "list": true
@@ -575,6 +575,9 @@ async fn route(config: &Config, req: &Request) -> Result<ToolOutcome> {
                 "tools": {
                     "list": true,
                     "call": true
+                },
+                "experimental": {
+                    "policy": true
                 },
                 "_meta": {
                     "server": "mcp-fs",
@@ -2526,7 +2529,8 @@ fn tool_definitions() -> Vec<Value> {
 		"annotations": {
                 "scopes": ["write:file"],
                 "priority": 0,
-                "group": "filesystem"
+                "group": "filesystem",
+                "preview": true
             },
 		"inputSchema": {
                 "type": "object",
@@ -2569,7 +2573,8 @@ fn tool_definitions() -> Vec<Value> {
 		"annotations": {
                 "scopes": ["write:file"],
                 "priority": 1,
-                "group": "filesystem"
+                "group": "filesystem",
+                "preview": true
             },
 		"inputSchema": {
                 "type": "object",
